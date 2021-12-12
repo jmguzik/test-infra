@@ -73,7 +73,7 @@ func (b Blockers) GetApplicable(org, repo, branch string) []Blocker {
 }
 
 // FindAll finds issues with label in the specified orgs/repos that should block tide.
-func FindAll(ghc githubClient, log *logrus.Entry, label string, orgRepoTokensByOrg map[string]string, splitQueryByOrg bool) (Blockers, error) {
+func FindAll(ghc githubClient, log *logrus.Entry, label string, orgRepoTokensByOrg map[string]string, splitQueryByOrg bool, maxGraphQLGoroutines int) (Blockers, error) {
 	queries := map[string]sets.String{}
 	for org, query := range orgRepoTokensByOrg {
 		if splitQueryByOrg {
@@ -89,16 +89,13 @@ func FindAll(ghc githubClient, log *logrus.Entry, label string, orgRepoTokensByO
 	var issues []Issue
 	var errs []error
 	var lock sync.Mutex
-	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	for org, query := range queries {
-		org, query := org, strings.Join(query.List(), " ")
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
+	queriesInParallel(
+		maxGraphQLGoroutines,
+		queries,
+		func(org string, query string) {
 			result, err := search(
 				ctx,
 				ghc,
@@ -113,11 +110,7 @@ func FindAll(ghc githubClient, log *logrus.Entry, label string, orgRepoTokensByO
 				return
 			}
 			issues = append(issues, result...)
-
-		}()
-
-	}
-	wg.Wait()
+		})
 
 	if err := utilerrors.NewAggregate(errs); err != nil {
 		return Blockers{}, fmt.Errorf("error searching for blocker issues: %w", err)
@@ -207,6 +200,35 @@ func search(ctx context.Context, ghc githubClient, githubOrg string, log *logrus
 		"remaining":      remaining,
 	}).Debug("Search for blocker query")
 	return ret, nil
+}
+
+func queriesInParallel(goroutines int, queries map[string]sets.String, process func(string, string)) {
+	type query struct {
+		org     string
+		queries sets.String
+	}
+	toQuery := make(chan query, len(queries))
+	for org, q := range queries {
+		toQuery <- query{org: org, queries: q}
+	}
+	close(toQuery)
+
+	graphQLRoutines := goroutines
+	if goroutines == 0 {
+		graphQLRoutines = len(queries)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < graphQLRoutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for q := range toQuery {
+				query := strings.Join(q.queries.List(), " ")
+				process(q.org, query)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // Issue holds graphql response data about issues

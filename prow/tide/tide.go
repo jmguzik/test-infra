@@ -392,7 +392,7 @@ func (c *Controller) Sync() error {
 				orgs = append(orgs, org)
 			}
 			orgRepoQuery := orgRepoQueryStrings(orgs, repos.UnsortedList(), orgExcepts)
-			blocks, err = blockers.FindAll(c.ghc, c.logger, label, orgRepoQuery, c.usesGitHubAppsAuth)
+			blocks, err = blockers.FindAll(c.ghc, c.logger, label, orgRepoQuery, c.usesGitHubAppsAuth, int(c.config().Tide.MaxGraphQLGoroutines))
 			if err != nil {
 				return err
 			}
@@ -449,9 +449,9 @@ func (c *Controller) Sync() error {
 
 func (c *Controller) query() (map[string]PullRequest, error) {
 	lock := sync.Mutex{}
-	wg := sync.WaitGroup{}
 	prs := make(map[string]PullRequest)
 	var errs []error
+	allQueries := make([]queryData, 0)
 	for i, query := range c.config().Tide.Queries {
 
 		// Use org-sharded queries only when GitHub apps auth is in use
@@ -461,38 +461,37 @@ func (c *Controller) query() (map[string]PullRequest, error) {
 		} else {
 			queries = map[string]string{"": query.Query()}
 		}
-
 		for org, q := range queries {
-			org, q, i := org, q, i
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				results, err := search(c.ghc.QueryWithGitHubAppsSupport, c.logger, q, time.Time{}, time.Now(), org)
-
-				resultString := "success"
-				if err != nil {
-					resultString = "error"
-				}
-				tideMetrics.queryResults.WithLabelValues(strconv.Itoa(i), org, resultString).Inc()
-
-				lock.Lock()
-				defer lock.Unlock()
-				if err != nil && len(results) == 0 {
-					c.logger.WithField("query", q).WithError(err).Warn("Failed to execute query.")
-					errs = append(errs, fmt.Errorf("query %d, err: %w", i, err))
-					return
-				}
-				if err != nil {
-					c.logger.WithError(err).WithField("query", q).Warning("found partial results")
-				}
-
-				for _, pr := range results {
-					prs[prKey(&pr)] = pr
-				}
-			}()
+			allQueries = append(allQueries, queryData{query: q, org: org, metricIndex: i})
 		}
 	}
-	wg.Wait()
+	queriesInParallel(
+		c.config().Tide.MaxGraphQLGoroutines,
+		allQueries,
+		func(q queryData) {
+			results, err := search(c.ghc.QueryWithGitHubAppsSupport, c.logger, q.query, time.Time{}, time.Now(), q.org)
+
+			resultString := "success"
+			if err != nil {
+				resultString = "error"
+			}
+			tideMetrics.queryResults.WithLabelValues(strconv.Itoa(q.metricIndex), q.org, resultString).Inc()
+
+			lock.Lock()
+			defer lock.Unlock()
+			if err != nil && len(results) == 0 {
+				c.logger.WithField("query", q).WithError(err).Warn("Failed to execute query.")
+				errs = append(errs, fmt.Errorf("query %d, err: %w", q.metricIndex, err))
+				return
+			}
+			if err != nil {
+				c.logger.WithError(err).WithField("query", q).Warning("found partial results")
+			}
+
+			for _, pr := range results {
+				prs[prKey(&pr)] = pr
+			}
+		})
 
 	return prs, utilerrors.NewAggregate(errs)
 }
@@ -528,6 +527,37 @@ func subpoolsInParallel(goroutines int, sps map[string]*subpool, process func(*s
 			defer wg.Done()
 			for sp := range queue {
 				process(sp)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+type queryData struct {
+	org         string
+	query       string
+	metricIndex int
+}
+
+func queriesInParallel(goroutines uint, queries []queryData, process func(queryData)) {
+
+	toQuery := make(chan queryData, len(queries))
+	for _, q := range queries {
+		toQuery <- q
+	}
+	close(toQuery)
+
+	graphQLRoutines := int(goroutines)
+	if goroutines == 0 {
+		graphQLRoutines = len(queries)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < graphQLRoutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for q := range toQuery {
+				process(q)
 			}
 		}()
 	}
